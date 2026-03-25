@@ -68,7 +68,3 @@
 - 如果你的环境依赖 `jdbc:zenith` 这类内部连接方式，建议把对应 jar 放到 `drivers/` 目录，或者用 `GAUSS_JDBC_JAR` 指向它。
 - 如果脚本自动下载的是公开 `opengaussjdbc`，默认会按 OpenGauss 风格拼接 JDBC URL。
 
-## 安全建议
-
-- 不要把真实的 `.codex-local/gauss-db.properties` 提交到 git。
-- 不要把私有驱动 jar 直接提交到公开仓库，除非你确认有分发权限。
