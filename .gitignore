@@ -1,0 +1,6 @@
+.codex-local/cache/
+.codex-local/lib/
+.codex-local/*.properties
+!.codex-local/*.properties.example
+drivers/*.jar
+

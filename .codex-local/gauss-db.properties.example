@@ -1,0 +1,14 @@
+# Minimal config: most users only need to change these three lines.
+db.host=127.0.0.1
+jdbc.username=replace_me
+jdbc.password=replace_me
+
+# Optional overrides.
+# db.port=1888
+# db.database=postgres
+# jdbc.url=jdbc:zenith:@127.0.0.1:1888
+# jdbc.driver.class=com.huawei.gauss.jdbc.ZenithDriver
+
+jdbc.max.rows=200
+jdbc.query.timeout.seconds=60
+

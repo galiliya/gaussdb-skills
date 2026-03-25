@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+JAVA_SRC="$PROJECT_ROOT/tools/src/GaussDbCli.java"
+CLASS_DIR="$PROJECT_ROOT/.codex-local/cache/gauss-db-cli"
+DEFAULT_CONFIG="$PROJECT_ROOT/.codex-local/gauss-db.properties"
+LIB_DIR="$PROJECT_ROOT/.codex-local/lib"
+POWERSHELL_EXE="${POWERSHELL_EXE:-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe}"
+PUBLIC_DRIVER_VERSION="${GAUSS_PUBLIC_DRIVER_VERSION:-503.2.T35}"
+PUBLIC_DRIVER_URL="https://repo1.maven.org/maven2/com/huaweicloud/gaussdb/opengaussjdbc/${PUBLIC_DRIVER_VERSION}/opengaussjdbc-${PUBLIC_DRIVER_VERSION}.jar"
+
+pick_java_home() {
+  if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/javac" && -x "${JAVA_HOME}/bin/java" ]]; then
+    printf '%s\n' "${JAVA_HOME}"
+    return 0
+  fi
+
+  if command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1; then
+    local javac_path
+    javac_path="$(readlink -f "$(command -v javac)")"
+    printf '%s\n' "$(cd "$(dirname "${javac_path}")/.." && pwd)"
+    return 0
+  fi
+
+  local candidates=(
+    "/usr/lib/jvm/default-java"
+    "/usr/lib/jvm/java-8-openjdk-amd64"
+    "/usr/lib/jvm/java-11-openjdk-amd64"
+    "/usr/lib/jvm/java-17-openjdk-amd64"
+  )
+
+  local java_home
+  for java_home in "${candidates[@]}"; do
+    if [[ -x "${java_home}/bin/javac" && -x "${java_home}/bin/java" ]]; then
+      printf '%s\n' "${java_home}"
+      return 0
+    fi
+  done
+
+  printf 'Unable to locate a usable JDK. Set JAVA_HOME before running this tool.\n' >&2
+  return 1
+}
+
+has_windows_powershell() {
+  [[ -x "${POWERSHELL_EXE}" ]]
+}
+
+pick_windows_java() {
+  if ! has_windows_powershell; then
+    return 1
+  fi
+
+  local java_exe
+  java_exe="$("${POWERSHELL_EXE}" -Command "Get-Command java -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source" | tr -d '\r' | head -n 1 || true)"
+  if [[ -n "${java_exe}" ]]; then
+    printf '%s\n' "${java_exe}"
+    return 0
+  fi
+
+  return 1
+}
+
+find_driver_in_dir() {
+  local dir="$1"
+  [[ -d "${dir}" ]] || return 1
+
+  find "${dir}" -maxdepth 3 -type f \
+    \( -name '*ZenithDriver*.jar' -o -name 'gauss-*.jar' -o -name 'opengaussjdbc-*.jar' \) \
+    | sort \
+    | head -n 1
+}
+
+download_public_driver() {
+  mkdir -p "${LIB_DIR}"
+  local target="${LIB_DIR}/opengaussjdbc-${PUBLIC_DRIVER_VERSION}.jar"
+
+  if [[ -f "${target}" ]]; then
+    printf '%s\n' "${target}"
+    return 0
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "${target}" "${PUBLIC_DRIVER_URL}"
+    printf '%s\n' "${target}"
+    return 0
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "${target}" "${PUBLIC_DRIVER_URL}"
+    printf '%s\n' "${target}"
+    return 0
+  fi
+
+  return 1
+}
+
+pick_driver_jar() {
+  if [[ -n "${GAUSS_JDBC_JAR:-}" && -f "${GAUSS_JDBC_JAR}" ]]; then
+    printf '%s\n' "${GAUSS_JDBC_JAR}"
+    return 0
+  fi
+
+  local driver_jar
+  for driver_jar in \
+    "$(find_driver_in_dir "${PROJECT_ROOT}/drivers" || true)" \
+    "$(find_driver_in_dir "${LIB_DIR}" || true)" \
+    "$(find_driver_in_dir "${HOME}/.m2/repository/com/huawei/gauss" || true)" \
+    "$(find_driver_in_dir "${HOME}/.m2/repository/com/huawei/gauss/jdbc" || true)" \
+    "$(find_driver_in_dir "${HOME}/.m2/repository/com/huaweicloud/gaussdb" || true)"; do
+    if [[ -n "${driver_jar}" && -f "${driver_jar}" ]]; then
+      printf '%s\n' "${driver_jar}"
+      return 0
+    fi
+  done
+
+  driver_jar="$(download_public_driver || true)"
+  if [[ -n "${driver_jar}" && -f "${driver_jar}" ]]; then
+    printf '%s\n' "${driver_jar}"
+    return 0
+  fi
+
+  printf 'Unable to locate a usable Gauss JDBC driver jar.\n' >&2
+  printf 'Set GAUSS_JDBC_JAR or place a driver jar under %s/drivers.\n' "${PROJECT_ROOT}" >&2
+  return 1
+}
+
+detect_driver_class() {
+  local driver_jar="$1"
+  if jar tf "${driver_jar}" 2>/dev/null | grep -q '^com/huawei/gauss/jdbc/ZenithDriver.class$'; then
+    printf '%s\n' 'com.huawei.gauss.jdbc.ZenithDriver'
+    return 0
+  fi
+  if jar tf "${driver_jar}" 2>/dev/null | grep -q '^com/huawei/opengauss/jdbc/Driver.class$'; then
+    printf '%s\n' 'com.huawei.opengauss.jdbc.Driver'
+    return 0
+  fi
+  return 1
+}
+
+ensure_compiled() {
+  local java_home="$1"
+  mkdir -p "${CLASS_DIR}"
+  if [[ ! -f "${CLASS_DIR}/GaussDbCli.class" || "${JAVA_SRC}" -nt "${CLASS_DIR}/GaussDbCli.class" ]]; then
+    "${java_home}/bin/javac" -encoding UTF-8 -d "${CLASS_DIR}" "${JAVA_SRC}"
+  fi
+}
+
+inject_default_config() {
+  local has_config="false"
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "--config" ]]; then
+      has_config="true"
+      break
+    fi
+  done
+
+  if [[ "${has_config}" == "true" ]]; then
+    printf '%s\0' "$@"
+    return 0
+  fi
+
+  if [[ ! -f "${DEFAULT_CONFIG}" ]]; then
+    printf 'Missing config: %s\n' "${DEFAULT_CONFIG}" >&2
+    printf 'Copy %s.example to %s and fill db.host, jdbc.username, jdbc.password.\n' "${DEFAULT_CONFIG}" "${DEFAULT_CONFIG}" >&2
+    return 1
+  fi
+
+  printf '%s\0' --config "${DEFAULT_CONFIG}" "$@"
+}
+
+require_default_config_if_needed() {
+  local has_config="false"
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "--config" ]]; then
+      has_config="true"
+      break
+    fi
+  done
+
+  if [[ "${has_config}" == "true" ]]; then
+    return 0
+  fi
+
+  if [[ ! -f "${DEFAULT_CONFIG}" ]]; then
+    printf 'Missing config: %s\n' "${DEFAULT_CONFIG}" >&2
+    printf 'Copy %s.example to %s and fill db.host, jdbc.username, jdbc.password.\n' "${DEFAULT_CONFIG}" "${DEFAULT_CONFIG}" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+run_linux() {
+  local java_home
+  java_home="$(pick_java_home)"
+
+  require_default_config_if_needed "$@"
+
+  local -a args=()
+  local item
+  while IFS= read -r -d '' item; do
+    args+=("${item}")
+  done < <(inject_default_config "$@")
+
+  local driver_jar
+  driver_jar="$(pick_driver_jar)"
+  ensure_compiled "${java_home}"
+
+  local driver_class=""
+  driver_class="$(detect_driver_class "${driver_jar}" || true)"
+
+  if [[ -n "${driver_class}" ]]; then
+    GAUSS_DB_DRIVER_CLASS="${driver_class}" exec "${java_home}/bin/java" -cp "${CLASS_DIR}:${driver_jar}" GaussDbCli "${args[@]}"
+  fi
+
+  exec "${java_home}/bin/java" -cp "${CLASS_DIR}:${driver_jar}" GaussDbCli "${args[@]}"
+}
+
+run_windows() {
+  require_default_config_if_needed "$@"
+
+  local -a args=()
+  local item
+  while IFS= read -r -d '' item; do
+    args+=("${item}")
+  done < <(inject_default_config "$@")
+
+  local driver_jar
+  driver_jar="$(pick_driver_jar)"
+
+  local java_exe
+  java_exe="$(pick_windows_java)"
+
+  local driver_class=""
+  driver_class="$(detect_driver_class "${driver_jar}" || true)"
+
+  local java_src_win
+  java_src_win="$(wslpath -w "${JAVA_SRC}")"
+  local class_dir_win
+  class_dir_win="$(wslpath -w "${CLASS_DIR}")"
+  local driver_jar_win
+  driver_jar_win="$(wslpath -w "${driver_jar}")"
+
+  local -a win_args=()
+  local arg
+  for arg in "${args[@]}"; do
+    if [[ "${arg}" == /* && -e "${arg}" ]]; then
+      win_args+=("$(wslpath -w "${arg}")")
+    else
+      win_args+=("${arg}")
+    fi
+  done
+
+  local args_payload=""
+  for arg in "${win_args[@]}"; do
+    args_payload+=$(printf "%s" "${arg}" | base64 -w 0)
+    args_payload+=":"
+  done
+  args_payload="${args_payload%:}"
+
+  local ps_script
+  read -r -d '' ps_script <<EOF || true
+\$javaExe = '${java_exe//\'/\'\'}'
+\$javaSrc = '${java_src_win//\'/\'\'}'
+\$classDir = '${class_dir_win//\'/\'\'}'
+\$driverJar = '${driver_jar_win//\'/\'\'}'
+\$payload = '${args_payload//\'/\'\'}'
+\$driverClass = '${driver_class//\'/\'\'}'
+New-Item -ItemType Directory -Force -Path \$classDir | Out-Null
+if (-not (Test-Path (Join-Path \$classDir 'GaussDbCli.class')) -or ((Get-Item \$javaSrc).LastWriteTimeUtc -gt (Get-Item (Join-Path \$classDir 'GaussDbCli.class')).LastWriteTimeUtc)) {
+  & ([System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName(\$javaExe), 'javac.exe')) -encoding UTF-8 -d \$classDir \$javaSrc
+  if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
+}
+\$decodedArgs = @()
+if (\$payload.Length -gt 0) {
+  foreach (\$part in \$payload.Split(':')) {
+    \$decodedArgs += [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(\$part))
+  }
+}
+if (\$driverClass.Length -gt 0) {
+  \$env:GAUSS_DB_DRIVER_CLASS = \$driverClass
+}
+& \$javaExe -cp "\$classDir;\$driverJar" GaussDbCli @decodedArgs
+exit \$LASTEXITCODE
+EOF
+
+  exec "${POWERSHELL_EXE}" -Command "${ps_script}"
+}
+
+main() {
+  if [[ "${GAUSS_DB_FORCE_LINUX:-0}" != "1" ]] && has_windows_powershell && pick_windows_java >/dev/null 2>&1; then
+    run_windows "$@"
+    return 0
+  fi
+
+  run_linux "$@"
+}
+
+main "$@"
